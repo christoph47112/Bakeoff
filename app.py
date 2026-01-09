@@ -1,22 +1,17 @@
 import streamlit as st
+import gspread
 from google.oauth2.service_account import Credentials
-from google.auth.transport.requests import Request
 
-st.title("Auth Debug Test")
+st.title("Sheet Access Test")
 
 creds = Credentials.from_service_account_info(
     st.secrets["gcp_service_account"],
-    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    scopes=["https://www.googleapis.com/auth/drive.readonly"],
 )
+gc = gspread.authorize(creds)
 
-st.write("Credentials geladen")
-
-try:
-    creds.refresh(Request())
-    st.success("TOKEN REFRESH OK")
-    st.write("Token läuft ab um:", creds.expiry)
-except Exception as e:
-    st.error("TOKEN REFRESH FAILED")
-    st.exception(e)
+files = gc.list_spreadsheet_files()
+st.write("Anzahl sichtbarer Sheets:", len(files))
+st.dataframe(files)
 
 st.stop()
