@@ -250,7 +250,10 @@ def plausibility_checks(freq_daily: pd.DataFrame, baseline: pd.DataFrame, inputs
 # ----------------------------
 st.title("🥐 Bake-Off Planer (Google Sheets)")
 
-sh = open_sheet()
+client = get_gspread_client()
+st.success("Google Auth OK")
+st.stop()
+
 ensure_tabs_and_headers(sh)
 
 config_df = read_tab(sh, "config")
