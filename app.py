@@ -1,46 +1,56 @@
 # =========================================================
-# Bake-Off Planer – Finale Markt-Version (1 Seite)
-# Workflow ohne Verwirrung:
-#   🔵 HEUTE: Backen eintragen (morgens / nachmittags)
-#   🟡 GESTERN: Abschrift eintragen + "vor 14 Uhr leer" + abschließen -> LERNEN
+# Bake-Off Planer (MDE-Style) – Frontend + Backend (Google Sheets)
 #
-# Warum so?
-# - Backmenge weiß man am Backtag (heute).
-# - Abschrift weiß man erst am Folgetag (gestern).
-# - Die App ordnet das automatisch zu -> keine Datumsverwechslung.
+# Ziel:
+# - Mitarbeiter sieht nur Frontend-Reiter:
+#     1) Backvorschlag (heute)  -> Vorschlag ansehen/überschreiben + Ist-Backen eintragen
+#     2) Abschriften (gestern)  -> Abschrift eintragen + Abschluss drücken (Lernen)
+#     3) Dashboard              -> kurze Auswertung
+# - Kein Datum auswählen, keine Verwirrung:
+#     Backen = HEUTE, Abschrift = GESTERN
+# - Lernen:
+#     Aus (gebacken - abschrift) wird Nachfrage geschätzt
+#     Vorschlag wird smarter (Demand + WasteRate + MorningShare)
+# - Stabiler Google-API Layer:
+#     - Wenige Calls, Retry, batch_update, Caching
 #
-# Google Sheet Tabs (werden automatisch angelegt):
-# - articles:      sku | name | active | created_at
-# - daily_log:     date | sku | baked_morning | baked_afternoon | waste_qty | early_empty | closed | created_at
-# - demand_model:  sku | weekday | demand | morning_share | waste_rate | updated_at
+# Google Sheet Tabs:
+# - articles      : sku | name | active | created_at
+# - bake_log      : date | sku | suggested_total | suggested_morning | suggested_afternoon
+#                  | override_total | baked_morning | baked_afternoon | note | updated_at
+# - waste_log     : date | sku | waste_qty | early_empty | closed | updated_at
+# - demand_model  : sku | weekday | demand | morning_share | waste_rate | updated_at
 # =========================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, timedelta
-import time as pytime
+from datetime import date, timedelta
+from datetime import datetime as dt
+import time
 
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
 # -------------------------
-# Config
+# Settings
 # -------------------------
 st.set_page_config(page_title="Bake-Off Planer", layout="wide")
 
-ALPHA = 0.18  # etwas schnelleres Lernen (MVP)
+# Lernparameter (MVP, aber brauchbar)
+ALPHA = 0.22                 # wie schnell passt sich Modell an
 START_DEMAND = 20.0
 START_MORNING_SHARE = 0.78
 START_WASTE_RATE = 0.08
-
-CACHE_TTL_SEC = 120
+TARGET_WASTE = 0.06
 
 WEEKDAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
+CACHE_TTL = 90  # Sekunden
+
 # -------------------------
-# Google Sheets (stabil)
+# Google auth
 # -------------------------
 @st.cache_resource
 def gs_client():
@@ -64,280 +74,367 @@ def gs_client():
 def open_spreadsheet():
     return gs_client().open_by_key(str(st.secrets["SHEET_ID"]).strip())
 
-def gspread_retry(fn, tries=6, base_sleep=0.7):
+def retry(fn, tries=6, base_sleep=0.6):
     last = None
     for i in range(tries):
         try:
             return fn()
         except APIError as e:
             last = e
-            pytime.sleep(min(base_sleep * (2 ** i), 8.0))
+            time.sleep(min(base_sleep * (2 ** i), 8.0))
     raise last
 
-def ensure_tabs(sh):
-    required = {
-        "articles": ["sku", "name", "active", "created_at"],
-        "daily_log": ["date", "sku", "baked_morning", "baked_afternoon", "waste_qty", "early_empty", "closed", "created_at"],
-        "demand_model": ["sku", "weekday", "demand", "morning_share", "waste_rate", "updated_at"],
-    }
-    existing = {w.title for w in sh.worksheets()}
-    for tab, headers in required.items():
-        if tab not in existing:
-            gspread_retry(lambda: sh.add_worksheet(title=tab, rows=4000, cols=max(12, len(headers) + 2)))
-        ws = sh.worksheet(tab)
-        row1 = ws.row_values(1)
-        if [x.strip() for x in row1[:len(headers)]] != headers:
-            gspread_retry(lambda: ws.clear())
-            gspread_retry(lambda: ws.update([headers]))
+# -------------------------
+# Sheet schema + creation (cached)
+# -------------------------
+REQUIRED_TABS = {
+    "articles": [
+        "sku","name","active","created_at"
+    ],
+    "bake_log": [
+        "date","sku",
+        "suggested_total","suggested_morning","suggested_afternoon",
+        "override_total","baked_morning","baked_afternoon",
+        "note","updated_at"
+    ],
+    "waste_log": [
+        "date","sku","waste_qty","early_empty","closed","updated_at"
+    ],
+    "demand_model": [
+        "sku","weekday","demand","morning_share","waste_rate","updated_at"
+    ],
+}
 
-def read_tab(sh, tab: str) -> pd.DataFrame:
-    ws = sh.worksheet(tab)
-    values = gspread_retry(lambda: ws.get_all_values())
-    if not values:
-        return pd.DataFrame()
-    headers = values[0]
-    rows = values[1:]
-    if not any(str(h).strip() for h in headers):
-        return pd.DataFrame()
-    rows2 = [r[:len(headers)] + [""] * max(0, len(headers) - len(r)) for r in rows]
-    return pd.DataFrame(rows2, columns=headers)
-
-def write_tab(sh, tab: str, df: pd.DataFrame):
-    ws = sh.worksheet(tab)
-    df2 = df.copy().replace({np.nan: ""})
-    values = [df2.columns.tolist()] + df2.astype(object).values.tolist()
-    gspread_retry(lambda: ws.clear())
-    gspread_retry(lambda: ws.update(values))
-
-def upsert_tab(sh, tab: str, df_new: pd.DataFrame, key_cols: list[str]):
-    df_old = read_tab(sh, tab)
-    if df_old.empty:
-        df = df_new.copy()
-    else:
-        df = pd.concat([df_old, df_new], ignore_index=True)
-
-    for c in key_cols:
-        if c not in df.columns:
-            df[c] = ""
-        df[c] = df[c].astype(str)
-
-    df = df.drop_duplicates(subset=key_cols, keep="last")
-    write_tab(sh, tab, df)
-
-@st.cache_data(ttl=CACHE_TTL_SEC)
-def load_all_cached(sheet_id: str) -> dict:
+@st.cache_resource
+def ensure_schema_once():
+    """
+    Läuft selten. Verhindert ständige worksheet-metadata calls.
+    """
     sh = open_spreadsheet()
-    ensure_tabs(sh)
-    return {
-        "articles": read_tab(sh, "articles"),
-        "daily_log": read_tab(sh, "daily_log"),
-        "demand_model": read_tab(sh, "demand_model"),
-    }
 
-def load_all(force=False) -> dict:
-    sid = str(st.secrets["SHEET_ID"]).strip()
-    if force:
-        load_all_cached.clear()
-    return load_all_cached(sid)
+    def _ensure():
+        existing_titles = [ws.title for ws in retry(lambda: sh.worksheets())]
+        for tab, headers in REQUIRED_TABS.items():
+            if tab not in existing_titles:
+                retry(lambda: sh.add_worksheet(title=tab, rows=4000, cols=max(12, len(headers)+2)))
+            ws = sh.worksheet(tab)
+            row1 = retry(lambda: ws.row_values(1))
+            if [x.strip() for x in row1[:len(headers)]] != headers:
+                retry(lambda: ws.clear())
+                retry(lambda: ws.update([headers]))
+    retry(_ensure)
+    return True
+
+def ws(tab: str):
+    ensure_schema_once()
+    sh = open_spreadsheet()
+    return sh.worksheet(tab)
 
 # -------------------------
-# Helper functions
+# Data helpers
 # -------------------------
-def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def clean_sku(x) -> str:
+    s = str(x).strip()
+    if not s or s.lower() in ("nan","none","null"):
+        return ""
+    return s
+
+def weekday_name(d: date) -> str:
+    return pd.to_datetime(d.isoformat()).day_name()
+
+def ensure_df_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = df.copy() if not df.empty else pd.DataFrame()
     for c in cols:
         if c not in out.columns:
             out[c] = ""
     return out
 
-def clean_sku(s) -> str:
-    s = str(s).strip()
-    if not s or s.lower() in ("nan", "none", "null"):
-        return ""
-    return s
+def now_iso():
+    return dt.utcnow().isoformat()
 
-def clean_sku_list(series: pd.Series) -> list[str]:
-    out = []
-    for x in series.tolist():
-        s = clean_sku(x)
-        if s:
-            out.append(s)
-    seen = set()
-    uniq = []
-    for s in out:
-        if s not in seen:
-            uniq.append(s)
-            seen.add(s)
-    return uniq
+# -------------------------
+# Minimal-call table read (cached)
+# -------------------------
+@st.cache_data(ttl=CACHE_TTL)
+def load_tables(_sheet_id: str) -> dict:
+    # _sheet_id in signature so cache invalidates if user changes it
+    out = {}
+    for tab, headers in REQUIRED_TABS.items():
+        w = ws(tab)
+        vals = retry(lambda: w.get_all_values())
+        if not vals:
+            out[tab] = pd.DataFrame(columns=headers)
+            continue
+        hdr = vals[0]
+        rows = vals[1:]
+        df = pd.DataFrame(rows, columns=hdr if hdr else headers)
+        df = ensure_df_cols(df, headers)
+        out[tab] = df
+    return out
 
-def weekday_name(d: date) -> str:
-    return pd.to_datetime(d.isoformat()).day_name()
+def invalidate_cache():
+    load_tables.clear()
 
-def ensure_model_rows(model: pd.DataFrame, active_skus: list[str]) -> pd.DataFrame:
-    model = ensure_columns(model, ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
-    if not active_skus:
+# -------------------------
+# Upsert rows efficiently (batch_update + append)
+# -------------------------
+def upsert_rows(tab: str, key_cols: list[str], rows: list[dict]):
+    """
+    Upsert rows into a worksheet with minimal calls.
+    - reads all values once to map key->row index
+    - batch updates changed rows
+    - appends new rows
+    """
+    if not rows:
+        return
+
+    w = ws(tab)
+    headers = REQUIRED_TABS[tab]
+
+    # read all current values once
+    values = retry(lambda: w.get_all_values())
+    if not values:
+        retry(lambda: w.update([headers]))
+        values = [headers]
+
+    current_headers = values[0]
+    if current_headers[:len(headers)] != headers:
+        # fix schema if broken
+        retry(lambda: w.clear())
+        retry(lambda: w.update([headers]))
+        values = [headers]
+
+    # build key->row index (1-based, header row=1)
+    key_to_row = {}
+    for i, r in enumerate(values[1:], start=2):
+        row_map = {headers[j]: (r[j] if j < len(r) else "") for j in range(len(headers))}
+        key = tuple(str(row_map.get(k, "")).strip() for k in key_cols)
+        if all(key):
+            key_to_row[key] = i
+
+    # prepare batch updates + appends
+    updates = []
+    appends = []
+
+    for row in rows:
+        row_norm = {h: row.get(h, "") for h in headers}
+        # clean keys
+        for k in key_cols:
+            row_norm[k] = str(row_norm.get(k, "")).strip()
+
+        key = tuple(row_norm[k] for k in key_cols)
+        row_values = [row_norm[h] for h in headers]
+
+        if all(key) and key in key_to_row:
+            rix = key_to_row[key]
+            # Update full row (A..)
+            end_col = chr(ord("A") + len(headers) - 1)
+            rng = f"A{rix}:{end_col}{rix}"
+            updates.append({"range": rng, "values": [row_values]})
+        else:
+            appends.append(row_values)
+
+    if updates:
+        retry(lambda: w.batch_update(updates))
+    for av in appends:
+        retry(lambda: w.append_row(av, value_input_option="USER_ENTERED"))
+
+    invalidate_cache()
+
+# -------------------------
+# Model logic
+# -------------------------
+def ensure_model_for_active(model: pd.DataFrame, skus: list[str]) -> pd.DataFrame:
+    model = ensure_df_cols(model, REQUIRED_TABS["demand_model"])
+    if not skus:
         return model
 
-    base = pd.MultiIndex.from_product([active_skus, WEEKDAYS], names=["sku","weekday"]).to_frame(index=False)
+    base = pd.MultiIndex.from_product([skus, WEEKDAYS], names=["sku","weekday"]).to_frame(index=False)
     out = base.merge(model, on=["sku","weekday"], how="left")
 
     out["demand"] = pd.to_numeric(out["demand"], errors="coerce").fillna(START_DEMAND)
     out["morning_share"] = pd.to_numeric(out["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
     out["waste_rate"] = pd.to_numeric(out["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
     out["updated_at"] = out["updated_at"].fillna("")
-    out["sku"] = out["sku"].astype(str)
-    out["weekday"] = out["weekday"].astype(str)
     return out
 
-def ensure_day_rows(sh, day_s: str, skus: list[str]):
-    """Sorgt dafür, dass daily_log für (day, sku) existiert (sonst leere Standardzeile)."""
-    if not skus:
-        return
-    existing = read_tab(sh, "daily_log")
-    existing = ensure_columns(existing, ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
-    if existing.empty:
-        existing_keys = set()
-    else:
-        existing["date"] = existing["date"].astype(str)
-        existing["sku"] = existing["sku"].astype(str)
-        existing_keys = set(zip(existing["date"], existing["sku"]))
-
-    rows = []
-    for sku in skus:
-        key = (day_s, sku)
-        if key not in existing_keys:
-            rows.append({
-                "date": day_s,
-                "sku": sku,
-                "baked_morning": 0,
-                "baked_afternoon": 0,
-                "waste_qty": 0,
-                "early_empty": "FALSE",
-                "closed": "FALSE",
-                "created_at": pd.Timestamp.utcnow().isoformat(),
-            })
-    if rows:
-        upsert_tab(sh, "daily_log", pd.DataFrame(rows), key_cols=["date","sku"])
-
 def recommend_total(demand: float, waste_rate: float) -> int:
-    base = max(0.0, float(demand))
-    # Wenn Abschriftquote hoch, leicht konservativer
-    penalty = max(0.0, float(waste_rate) - 0.06)  # Ziel 6%
-    adj = 1.0 - 0.7 * penalty
-    adj = float(np.clip(adj, 0.70, 1.15))
-    return int(np.round(base * adj))
+    demand = max(0.0, float(demand))
+    wr = float(np.clip(float(waste_rate), 0.0, 1.0))
+
+    # wenn Waste zu hoch -> konservativer; wenn Waste sehr niedrig -> leicht aggressiver
+    penalty = wr - TARGET_WASTE
+    adj = 1.0 - 0.70 * max(0.0, penalty) + 0.15 * max(0.0, -penalty)
+    adj = float(np.clip(adj, 0.70, 1.20))
+
+    return int(np.round(demand * adj))
 
 def split_qty(total: int, morning_share: float) -> tuple[int, int]:
     total = max(0, int(total))
-    ms = float(np.clip(morning_share, 0.55, 0.95))
+    ms = float(np.clip(float(morning_share), 0.55, 0.95))
     m = int(np.round(total * ms))
     a = max(0, total - m)
-    # wenn Nachmittagsmenge minimal: als 1× behandeln
     if a <= 2:
         return total, 0
     return m, a
 
-def parse_bool(x) -> bool:
-    return str(x).strip().lower() in ("true","1","yes","ja")
+def learn_from_yesterday(model: pd.DataFrame, y_rows: pd.DataFrame, wd_y: str) -> pd.DataFrame:
+    """
+    y_rows: waste_log + bake_log merged by sku for yesterday
+    Learn:
+      demand <- EMA(sold_est = baked_total - waste)
+      waste_rate <- EMA(waste / baked_total)
+      morning_share <- EMA(target adjustments using early_empty signal)
+    """
+    out = model.copy()
+    # numeric
+    out["demand"] = pd.to_numeric(out["demand"], errors="coerce").fillna(START_DEMAND)
+    out["morning_share"] = pd.to_numeric(out["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
+    out["waste_rate"] = pd.to_numeric(out["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
 
-def clamp01(x: float) -> float:
-    return float(np.clip(float(x), 0.0, 1.0))
+    y_rows = y_rows.copy()
+    y_rows["baked_total"] = pd.to_numeric(y_rows.get("baked_total", 0), errors="coerce").fillna(0.0)
+    y_rows["waste_qty"] = pd.to_numeric(y_rows.get("waste_qty", 0), errors="coerce").fillna(0.0)
+    y_rows["early_empty"] = y_rows.get("early_empty", False).astype(bool)
+
+    for _, r in y_rows.iterrows():
+        sku = clean_sku(r.get("sku", ""))
+        if not sku:
+            continue
+
+        baked_total = float(r["baked_total"])
+        waste = float(r["waste_qty"])
+        sold_est = max(0.0, baked_total - waste)
+        wr_obs = (waste / baked_total) if baked_total > 0 else 0.0
+        wr_obs = float(np.clip(wr_obs, 0.0, 1.0))
+
+        mask = (out["sku"].astype(str) == sku) & (out["weekday"].astype(str) == wd_y)
+        if not mask.any():
+            continue
+        i = out.index[mask][0]
+
+        old_d = float(out.at[i, "demand"])
+        old_ms = float(out.at[i, "morning_share"])
+        old_wr = float(out.at[i, "waste_rate"])
+
+        # Demand update
+        new_d = (1 - ALPHA) * old_d + ALPHA * sold_est
+
+        # Waste rate update
+        new_wr = (1 - ALPHA) * old_wr + ALPHA * wr_obs
+        new_wr = float(np.clip(new_wr, 0.0, 1.0))
+
+        # Morning share target
+        ms_target = old_ms
+        if bool(r["early_empty"]):
+            ms_target = min(0.95, old_ms + 0.06)
+        else:
+            if new_wr >= 0.12:
+                ms_target = max(0.55, old_ms - 0.04)
+
+        new_ms = (1 - ALPHA) * old_ms + ALPHA * ms_target
+        new_ms = float(np.clip(new_ms, 0.55, 0.95))
+
+        out.at[i, "demand"] = max(0.0, float(new_d))
+        out.at[i, "waste_rate"] = float(new_wr)
+        out.at[i, "morning_share"] = float(new_ms)
+        out.at[i, "updated_at"] = now_iso()
+
+    return out
 
 # -------------------------
-# UI Header
+# Frontend
 # -------------------------
-st.title("🥐 Bake-Off Planer")
-st.caption("Einfach: **Heute backen eintragen** + **Gestern Abschrift eintragen** → App lernt und gibt bessere Backvorschläge.")
+st.title("🥐 Bake-Off (MDE)")
 
-top_l, top_r = st.columns([5, 1])
-with top_r:
+colA, colB = st.columns([5, 1])
+with colB:
     if st.button("🔄 Neu laden"):
-        load_all(force=True)
+        invalidate_cache()
         st.rerun()
 
-# -------------------------
-# Load data
-# -------------------------
-try:
-    tabs = load_all(force=False)
-except Exception as e:
-    st.error("Google API Problem. Bitte nochmal „Neu laden“ drücken.")
-    st.exception(e)
-    st.stop()
+sheet_id = str(st.secrets["SHEET_ID"]).strip()
+tabs = load_tables(sheet_id)
 
-articles = ensure_columns(tabs["articles"], ["sku","name","active","created_at"])
-daily_log = ensure_columns(tabs["daily_log"], ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
-model = ensure_columns(tabs["demand_model"], ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
+articles = ensure_df_cols(tabs["articles"], REQUIRED_TABS["articles"])
+bake_log = ensure_df_cols(tabs["bake_log"], REQUIRED_TABS["bake_log"])
+waste_log = ensure_df_cols(tabs["waste_log"], REQUIRED_TABS["waste_log"])
+model = ensure_df_cols(tabs["demand_model"], REQUIRED_TABS["demand_model"])
 
-# Clean articles
+# Clean + active articles
 articles["sku"] = articles["sku"].astype(str).map(clean_sku)
 articles = articles[articles["sku"] != ""].copy()
 articles["name"] = articles["name"].astype(str)
 articles["active"] = articles["active"].astype(str)
 
-active_articles = articles[articles["active"].str.lower().isin(["true","1","yes","ja"])].copy()
-active_articles = active_articles.sort_values("name")
-active_skus = clean_sku_list(active_articles["sku"])
+active = articles[articles["active"].str.lower().isin(["true","1","yes","ja"])].copy()
+active = active.sort_values("name")
+active_skus = [clean_sku(x) for x in active["sku"].tolist() if clean_sku(x)]
 
-# No active articles -> prompt
-st.markdown("### 🧺 Artikel (Stamm)")
-with st.expander("Artikel anlegen / aktivieren (selten nötig)", expanded=(len(active_skus) == 0)):
+# Article management (small)
+with st.expander("🧺 Artikel verwalten (selten)", expanded=(len(active_skus) == 0)):
     c1, c2, c3 = st.columns([1, 2, 1])
     with c1:
-        new_sku = st.text_input("PLU / Artikelnummer")
+        new_sku = st.text_input("PLU / Artikelnummer", value="")
     with c2:
-        new_name = st.text_input("Artikelname")
+        new_name = st.text_input("Artikelname", value="")
     with c3:
         new_active = st.checkbox("Aktiv", value=True)
 
-    if st.button("➕ Artikel hinzufügen"):
+    if st.button("➕ Artikel speichern"):
         if not new_sku.strip() or not new_name.strip():
             st.warning("Bitte PLU und Artikelname ausfüllen.")
         else:
-            sh = open_spreadsheet()
-            row = pd.DataFrame([{
+            row = {
                 "sku": new_sku.strip(),
                 "name": new_name.strip(),
                 "active": "TRUE" if new_active else "FALSE",
-                "created_at": pd.Timestamp.utcnow().isoformat(),
-            }])
-            upsert_tab(sh, "articles", row, key_cols=["sku"])
-            load_all(force=True)
-            st.success("Artikel gespeichert.")
+                "created_at": now_iso(),
+            }
+            upsert_rows("articles", ["sku"], [row])
+            st.success("Gespeichert.")
             st.rerun()
 
     if not articles.empty:
         ui = articles.copy()
         ui["active"] = ui["active"].str.lower().isin(["true","1","yes","ja"])
-        edited = st.data_editor(ui[["sku","name","active"]], use_container_width=True, num_rows="fixed", hide_index=True)
-        if st.button("💾 Artikelstatus speichern"):
-            sh = open_spreadsheet()
-            out = edited.copy()
-            out["active"] = out["active"].apply(lambda v: "TRUE" if bool(v) else "FALSE")
-            out["created_at"] = pd.Timestamp.utcnow().isoformat()
-            upsert_tab(sh, "articles", out[["sku","name","active","created_at"]], key_cols=["sku"])
-            load_all(force=True)
+        edited = st.data_editor(ui[["sku","name","active"]], use_container_width=True, hide_index=True, num_rows="fixed")
+        if st.button("💾 Aktiv-Status übernehmen"):
+            rows = []
+            for _, r in edited.iterrows():
+                rows.append({
+                    "sku": clean_sku(r["sku"]),
+                    "name": str(r["name"]),
+                    "active": "TRUE" if bool(r["active"]) else "FALSE",
+                    "created_at": now_iso(),
+                })
+            upsert_rows("articles", ["sku"], rows)
             st.success("Gespeichert.")
             st.rerun()
 
-# Refresh active after possible changes
-tabs = load_all(force=False)
-articles = ensure_columns(tabs["articles"], ["sku","name","active","created_at"])
-articles["sku"] = articles["sku"].astype(str).map(clean_sku)
-articles = articles[articles["sku"] != ""].copy()
-articles["name"] = articles["name"].astype(str)
-articles["active"] = articles["active"].astype(str)
-
-active_articles = articles[articles["active"].str.lower().isin(["true","1","yes","ja"])].copy()
-active_articles = active_articles.sort_values("name")
-active_skus = clean_sku_list(active_articles["sku"])
-
+# Must have active
 if not active_skus:
-    st.warning("Bitte mindestens 1 Artikel aktivieren/anlegen.")
+    st.warning("Bitte mindestens 1 Artikel anlegen/aktivieren.")
     st.stop()
 
-# Ensure model rows for active skus
-model = ensure_model_rows(model, active_skus)
+# Ensure model rows exist for active SKUs (in memory; write only if missing)
+model_full = ensure_model_for_active(model, active_skus)
+if model_full.shape[0] != model.shape[0] or set(model_full.columns) != set(model.columns):
+    # write back to ensure backend complete
+    rows = []
+    for _, r in model_full.iterrows():
+        rows.append({
+            "sku": str(r["sku"]),
+            "weekday": str(r["weekday"]),
+            "demand": float(r["demand"]),
+            "morning_share": float(r["morning_share"]),
+            "waste_rate": float(r["waste_rate"]),
+            "updated_at": str(r.get("updated_at", "")) or "",
+        })
+    upsert_rows("demand_model", ["sku","weekday"], rows)
+    tabs = load_tables(sheet_id)
+    model = ensure_df_cols(tabs["demand_model"], REQUIRED_TABS["demand_model"])
+    model_full = ensure_model_for_active(model, active_skus)
 
 # Dates
 today = date.today()
@@ -347,380 +444,361 @@ yesterday_s = yesterday.isoformat()
 wd_today = weekday_name(today)
 wd_yesterday = weekday_name(yesterday)
 
-# Ensure daily rows exist for today & yesterday (so Tabellen immer vollständig sind)
-sh = open_spreadsheet()
-ensure_tabs(sh)
-ensure_day_rows(sh, today_s, active_skus)
-ensure_day_rows(sh, yesterday_s, active_skus)
+# Tabs like MDE
+tab1, tab2, tab3 = st.tabs(["📌 Backvorschlag (Heute)", "🧾 Abschriften (Gestern)", "📊 Dashboard"])
 
-# Reload logs after ensuring rows
-tabs = load_all(force=True)
-daily_log = ensure_columns(tabs["daily_log"], ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
-daily_log["date"] = daily_log["date"].astype(str)
-daily_log["sku"] = daily_log["sku"].astype(str)
+# ---------------------------------------------------------
+# TAB 1: Backvorschlag (Heute) + Überschreiben + Ist-Backen
+# ---------------------------------------------------------
+with tab1:
+    st.subheader("Backvorschlag (Heute)")
+    st.caption("Du kannst den Vorschlag pro Artikel überschreiben. Das wird gespeichert und später fürs Lernen berücksichtigt.")
 
-today_log = daily_log[daily_log["date"] == today_s].copy()
-yest_log = daily_log[daily_log["date"] == yesterday_s].copy()
+    # Build today suggestion from model
+    m_today = model_full[model_full["weekday"].astype(str) == wd_today].copy()
+    m_today = m_today.merge(active[["sku","name"]], on="sku", how="inner")
 
-# Normalize numeric fields
-for df in (today_log, yest_log):
-    df["baked_morning"] = pd.to_numeric(df["baked_morning"], errors="coerce").fillna(0).astype(int)
-    df["baked_afternoon"] = pd.to_numeric(df["baked_afternoon"], errors="coerce").fillna(0).astype(int)
-    df["waste_qty"] = pd.to_numeric(df["waste_qty"], errors="coerce").fillna(0).astype(int)
-    df["early_empty"] = df["early_empty"].apply(parse_bool)
-    df["closed"] = df["closed"].apply(parse_bool)
+    m_today["demand"] = pd.to_numeric(m_today["demand"], errors="coerce").fillna(START_DEMAND)
+    m_today["morning_share"] = pd.to_numeric(m_today["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
+    m_today["waste_rate"] = pd.to_numeric(m_today["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
 
-# -------------------------
-# PLANUNG (Heute) – Empfehlung
-# -------------------------
-st.divider()
-st.markdown("## 🔵 Heute: Backvorschlag (automatisch)")
+    m_today["suggested_total"] = m_today.apply(lambda r: recommend_total(r["demand"], r["waste_rate"]), axis=1)
+    sp = m_today.apply(lambda r: split_qty(int(r["suggested_total"]), float(r["morning_share"])), axis=1)
+    m_today["suggested_morning"] = [a for a, b in sp]
+    m_today["suggested_afternoon"] = [b for a, b in sp]
 
-plan = model[model["weekday"].astype(str) == wd_today].copy()
-plan = plan.merge(active_articles[["sku","name"]], on="sku", how="inner")
-plan["demand"] = pd.to_numeric(plan["demand"], errors="coerce").fillna(START_DEMAND)
-plan["morning_share"] = pd.to_numeric(plan["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
-plan["waste_rate"] = pd.to_numeric(plan["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
+    # Merge with today's existing bake_log (if any)
+    bake_log["date"] = bake_log["date"].astype(str)
+    bake_log["sku"] = bake_log["sku"].astype(str).map(clean_sku)
+    b_today = bake_log[bake_log["date"] == today_s].copy()
 
-plan["rec_total"] = plan.apply(lambda r: recommend_total(r["demand"], r["waste_rate"]), axis=1)
-spl = plan.apply(lambda r: split_qty(int(r["rec_total"]), float(r["morning_share"])), axis=1)
-plan["rec_morning"] = [m for m, a in spl]
-plan["rec_afternoon"] = [a for m, a in spl]
-plan["mode"] = np.where(plan["rec_afternoon"] > 0, "2× (morgens + nachm.)", "1× (nur morgens)")
+    view = m_today.merge(
+        b_today[[
+            "sku","override_total","baked_morning","baked_afternoon","note",
+            "suggested_total","suggested_morning","suggested_afternoon"
+        ]],
+        on="sku",
+        how="left",
+        suffixes=("","_saved")
+    )
 
-def hint_row(r):
-    wr = float(r["waste_rate"])
-    if wr >= 0.14:
-        return "Abschrift hoch → vorsichtiger planen."
-    if r["rec_afternoon"] == 0:
-        return "Heute reicht meist morgens."
-    return "Nachmittags kleiner Nachschub."
+    # If stored suggested exists, keep it (so suggestion doesn't shift mid-day)
+    for c in ["suggested_total","suggested_morning","suggested_afternoon"]:
+        view[c] = pd.to_numeric(view[c], errors="coerce")
+        view[c + "_saved"] = pd.to_numeric(view.get(c + "_saved"), errors="coerce")
+        view[c] = view[c + "_saved"].where(view[c + "_saved"].notna(), view[c])
+        if c + "_saved" in view.columns:
+            view = view.drop(columns=[c + "_saved"])
 
-plan["hint"] = plan.apply(hint_row, axis=1)
-plan_view = plan[["name","rec_morning","rec_afternoon","mode","hint"]].sort_values(["rec_morning","rec_afternoon"], ascending=False)
-st.dataframe(plan_view, use_container_width=True, hide_index=True)
+    view["override_total"] = pd.to_numeric(view["override_total"], errors="coerce").fillna(view["suggested_total"]).astype(int)
+    view["baked_morning"] = pd.to_numeric(view["baked_morning"], errors="coerce").fillna(0).astype(int)
+    view["baked_afternoon"] = pd.to_numeric(view["baked_afternoon"], errors="coerce").fillna(0).astype(int)
+    view["note"] = view["note"].fillna("")
 
-# -------------------------
-# 🔵 HEUTE: Backen eintragen
-# -------------------------
-st.divider()
-st.markdown("## 🔵 Heute: Backen eintragen")
-st.caption("Hier trägst du **heute** ein, wie viel wirklich gebacken wurde. Abschrift kommt morgen in den Abschluss (automatisch als „Gestern“).")
+    # Filters
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        q = st.text_input("Suche", value="", key="q_today")
+    with c2:
+        only_pos = st.checkbox("Nur Vorschlag > 0", value=True)
+    with c3:
+        only_touched = st.checkbox("Nur bearbeitet", value=False)
 
-# Build today work table
-today_tbl = active_articles[["sku","name"]].merge(
-    plan[["sku","rec_morning","rec_afternoon","mode"]],
-    on="sku", how="left"
-).merge(
-    today_log[["sku","baked_morning","baked_afternoon"]],
-    on="sku", how="left"
-)
+    v = view.copy()
+    if q.strip():
+        qq = q.strip().lower()
+        v = v[v["name"].str.lower().str.contains(qq) | v["sku"].str.lower().str.contains(qq)]
+    if only_pos:
+        v = v[v["suggested_total"] > 0]
+    if only_touched:
+        v = v[(v["baked_morning"] + v["baked_afternoon"] > 0) | (v["override_total"] != v["suggested_total"]) | (v["note"].astype(str).str.len() > 0)]
 
-today_tbl["baked_morning"] = pd.to_numeric(today_tbl["baked_morning"], errors="coerce").fillna(0).astype(int)
-today_tbl["baked_afternoon"] = pd.to_numeric(today_tbl["baked_afternoon"], errors="coerce").fillna(0).astype(int)
+    editor = st.data_editor(
+        v[[
+            "sku","name",
+            "suggested_total","suggested_morning","suggested_afternoon",
+            "override_total",
+            "baked_morning","baked_afternoon",
+            "note"
+        ]],
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "suggested_total": st.column_config.NumberColumn("Vorschlag gesamt", disabled=True),
+            "suggested_morning": st.column_config.NumberColumn("Vorschlag morgens", disabled=True),
+            "suggested_afternoon": st.column_config.NumberColumn("Vorschlag nachm.", disabled=True),
+            "override_total": st.column_config.NumberColumn("Überschreiben (gesamt)", min_value=0, step=1),
+            "baked_morning": st.column_config.NumberColumn("Ist gebacken morgens", min_value=0, step=1),
+            "baked_afternoon": st.column_config.NumberColumn("Ist gebacken nachm.", min_value=0, step=1),
+            "note": st.column_config.TextColumn("Notiz (optional)"),
+        }
+    )
 
-t1, t2, t3 = st.columns([2, 1, 1])
-with t1:
-    q_today = st.text_input("Suche (heute)", value="")
-with t2:
-    only_rec_today = st.checkbox("Nur Empfehlung > 0 (heute)", value=True)
-with t3:
-    only_edited_today = st.checkbox("Nur bearbeitete (heute)", value=False)
+    if st.button("💾 Heute speichern (Backvorschlag + Ist)", type="primary"):
+        # Merge edited rows back into full set by sku
+        base = view.set_index("sku")
+        ed = editor.copy()
+        ed["sku"] = ed["sku"].astype(str).map(clean_sku)
+        ed = ed[ed["sku"] != ""].set_index("sku")
 
-today_view = today_tbl.copy()
-if q_today.strip():
-    qq = q_today.strip().lower()
-    today_view = today_view[
-        today_view["name"].astype(str).str.lower().str.contains(qq) |
-        today_view["sku"].astype(str).str.lower().str.contains(qq)
-    ]
-if only_rec_today:
-    today_view = today_view[(today_view["rec_morning"].fillna(0) + today_view["rec_afternoon"].fillna(0)) > 0]
-if only_edited_today:
-    today_view = today_view[(today_view["baked_morning"] + today_view["baked_afternoon"]) > 0]
+        common = base.index.intersection(ed.index)
+        base.loc[common, "override_total"] = pd.to_numeric(ed.loc[common, "override_total"], errors="coerce").fillna(base.loc[common, "override_total"]).astype(int)
+        base.loc[common, "baked_morning"] = pd.to_numeric(ed.loc[common, "baked_morning"], errors="coerce").fillna(0).astype(int)
+        base.loc[common, "baked_afternoon"] = pd.to_numeric(ed.loc[common, "baked_afternoon"], errors="coerce").fillna(0).astype(int)
+        base.loc[common, "note"] = ed.loc[common, "note"].fillna("").astype(str)
 
-today_editor = st.data_editor(
-    today_view[["sku","name","rec_morning","rec_afternoon","mode","baked_morning","baked_afternoon"]],
-    use_container_width=True,
-    hide_index=True,
-    num_rows="fixed",
-    column_config={
-        "rec_morning": st.column_config.NumberColumn("Empf. morgens", disabled=True),
-        "rec_afternoon": st.column_config.NumberColumn("Empf. nachm.", disabled=True),
-        "mode": st.column_config.TextColumn("Modus", disabled=True),
-        "baked_morning": st.column_config.NumberColumn("Heute morgens gebacken", min_value=0, step=1),
-        "baked_afternoon": st.column_config.NumberColumn("Heute nachmittags gebacken", min_value=0, step=1),
-    }
-)
+        base = base.reset_index()
 
-save_today = st.button("💾 Heute speichern", type="secondary")
-if save_today:
-    # merge back into full today table by sku
-    upd = today_editor.copy()
-    upd["sku"] = upd["sku"].astype(str).map(clean_sku)
-    upd = upd[upd["sku"] != ""].copy()
+        rows = []
+        for _, r in base.iterrows():
+            rows.append({
+                "date": today_s,
+                "sku": str(r["sku"]),
+                "suggested_total": int(r["suggested_total"]),
+                "suggested_morning": int(r["suggested_morning"]),
+                "suggested_afternoon": int(r["suggested_afternoon"]),
+                "override_total": int(r["override_total"]),
+                "baked_morning": int(r["baked_morning"]),
+                "baked_afternoon": int(r["baked_afternoon"]),
+                "note": str(r.get("note","") or ""),
+                "updated_at": now_iso(),
+            })
 
-    # apply updates to base today_tbl
-    base = today_tbl.copy()
-    base["sku"] = base["sku"].astype(str)
-    base = base.set_index("sku")
-    upd = upd.set_index("sku")
+        upsert_rows("bake_log", ["date","sku"], rows)
+        st.success("Heute gespeichert ✅")
+        st.rerun()
 
-    common = base.index.intersection(upd.index)
-    base.loc[common, "baked_morning"] = pd.to_numeric(upd.loc[common, "baked_morning"], errors="coerce").fillna(0).astype(int)
-    base.loc[common, "baked_afternoon"] = pd.to_numeric(upd.loc[common, "baked_afternoon"], errors="coerce").fillna(0).astype(int)
-    base = base.reset_index()
+# ---------------------------------------------------------
+# TAB 2: Abschriften (Gestern) + Abschluss -> Lernen
+# ---------------------------------------------------------
+with tab2:
+    st.subheader("Abschriften (Gestern)")
+    st.caption("Hier trägst du die Abschrift für **gestern** ein. Danach: „Abschluss & Lernen“ → Vorschläge werden besser.")
 
-    rows = []
-    for _, r in base.iterrows():
-        rows.append({
-            "date": today_s,
-            "sku": str(r["sku"]),
-            "baked_morning": int(r["baked_morning"]),
-            "baked_afternoon": int(r["baked_afternoon"]),
-            # Abschlussfelder bleiben wie in Sheet (heute noch nicht relevant)
-            "waste_qty": int(today_log.loc[today_log["sku"] == str(r["sku"]), "waste_qty"].iloc[0]) if (today_log["sku"] == str(r["sku"])).any() else 0,
-            "early_empty": "TRUE" if (today_log.loc[today_log["sku"] == str(r["sku"]), "early_empty"].iloc[0] if (today_log["sku"] == str(r["sku"])).any() else False) else "FALSE",
-            "closed": "TRUE" if (today_log.loc[today_log["sku"] == str(r["sku"]), "closed"].iloc[0] if (today_log["sku"] == str(r["sku"])).any() else False) else "FALSE",
-            "created_at": pd.Timestamp.utcnow().isoformat(),
-        })
+    # Build yesterday view: show what was baked yesterday + waste inputs
+    bake_log["date"] = bake_log["date"].astype(str)
+    b_y = bake_log[bake_log["date"] == yesterday_s].copy()
+    b_y["sku"] = b_y["sku"].astype(str).map(clean_sku)
+    b_y["baked_morning"] = pd.to_numeric(b_y["baked_morning"], errors="coerce").fillna(0).astype(int)
+    b_y["baked_afternoon"] = pd.to_numeric(b_y["baked_afternoon"], errors="coerce").fillna(0).astype(int)
+    b_y["baked_total"] = b_y["baked_morning"] + b_y["baked_afternoon"]
 
-    upsert_tab(sh, "daily_log", pd.DataFrame(rows), key_cols=["date","sku"])
-    load_all(force=True)
-    st.success("Heute gespeichert ✅")
-    st.rerun()
+    waste_log["date"] = waste_log["date"].astype(str)
+    waste_log["sku"] = waste_log["sku"].astype(str).map(clean_sku)
+    w_y = waste_log[waste_log["date"] == yesterday_s].copy()
+    if w_y.empty:
+        w_y = pd.DataFrame(columns=REQUIRED_TABS["waste_log"])
 
-# -------------------------
-# 🟡 GESTERN: Abschluss & Lernen
-# -------------------------
-st.divider()
-st.markdown("## 🟡 Gestern: Abschrift eintragen + abschließen (damit die App lernt)")
-st.caption("Hier trägst du **morgen/früh** ein, was **gestern** abgeschrieben wurde. Beim Abschluss lernt die App und aktualisiert die Empfehlungen.")
+    w_y["waste_qty"] = pd.to_numeric(w_y.get("waste_qty", 0), errors="coerce").fillna(0).astype(int)
+    w_y["early_empty"] = w_y.get("early_empty","FALSE").astype(str).str.lower().isin(["true","1","yes","ja"])
+    w_y["closed"] = w_y.get("closed","FALSE").astype(str).str.lower().isin(["true","1","yes","ja"])
 
-# Build yesterday close table
-y_tbl = active_articles[["sku","name"]].merge(
-    yest_log[["sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed"]],
-    on="sku", how="left"
-)
+    base = active[["sku","name"]].copy()
+    base = base.merge(b_y[["sku","baked_total"]], on="sku", how="left").fillna({"baked_total": 0})
+    base = base.merge(w_y[["sku","waste_qty","early_empty","closed"]], on="sku", how="left")
 
-y_tbl["baked_morning"] = pd.to_numeric(y_tbl["baked_morning"], errors="coerce").fillna(0).astype(int)
-y_tbl["baked_afternoon"] = pd.to_numeric(y_tbl["baked_afternoon"], errors="coerce").fillna(0).astype(int)
-y_tbl["waste_qty"] = pd.to_numeric(y_tbl["waste_qty"], errors="coerce").fillna(0).astype(int)
-y_tbl["early_empty"] = y_tbl["early_empty"].fillna(False).astype(bool)
-y_tbl["closed"] = y_tbl["closed"].fillna(False).astype(bool)
+    base["baked_total"] = pd.to_numeric(base["baked_total"], errors="coerce").fillna(0).astype(int)
+    base["waste_qty"] = pd.to_numeric(base["waste_qty"], errors="coerce").fillna(0).astype(int)
+    base["early_empty"] = base["early_empty"].fillna(False).astype(bool)
+    base["closed"] = base["closed"].fillna(False).astype(bool)
 
-is_closed = bool(y_tbl["closed"].all()) if len(y_tbl) > 0 else False
-if is_closed:
-    st.success("Gestern ist bereits abgeschlossen ✅ (Du kannst trotzdem Werte korrigieren und erneut abschließen, falls nötig.)")
+    already_closed = bool(base["closed"].all()) if len(base) else False
+    if already_closed:
+        st.success("Gestern ist bereits abgeschlossen ✅ (du kannst trotzdem korrigieren und erneut abschließen).")
 
-y1, y2, y3 = st.columns([2, 1, 1])
-with y1:
-    q_y = st.text_input("Suche (gestern)", value="")
-with y2:
-    only_baked_y = st.checkbox("Nur Artikel mit Backen (gestern)", value=False)
-with y3:
-    only_edited_y = st.checkbox("Nur bearbeitete (gestern)", value=False)
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        q2 = st.text_input("Suche", value="", key="q_y")
+    with c2:
+        only_baked = st.checkbox("Nur mit Backen", value=True)
+    with c3:
+        only_edited = st.checkbox("Nur bearbeitet", value=False)
 
-y_view = y_tbl.copy()
-if q_y.strip():
-    qq = q_y.strip().lower()
-    y_view = y_view[
-        y_view["name"].astype(str).str.lower().str.contains(qq) |
-        y_view["sku"].astype(str).str.lower().str.contains(qq)
-    ]
-if only_baked_y:
-    y_view = y_view[(y_view["baked_morning"] + y_view["baked_afternoon"]) > 0]
-if only_edited_y:
-    y_view = y_view[(y_view["waste_qty"] > 0) | (y_view["early_empty"] == True)]
+    v = base.copy()
+    if q2.strip():
+        qq = q2.strip().lower()
+        v = v[v["name"].str.lower().str.contains(qq) | v["sku"].str.lower().str.contains(qq)]
+    if only_baked:
+        v = v[v["baked_total"] > 0]
+    if only_edited:
+        v = v[(v["waste_qty"] > 0) | (v["early_empty"] == True)]
 
-y_editor = st.data_editor(
-    y_view[["sku","name","baked_morning","baked_afternoon","waste_qty","early_empty"]],
-    use_container_width=True,
-    hide_index=True,
-    num_rows="fixed",
-    column_config={
-        "baked_morning": st.column_config.NumberColumn("Gestern morgens gebacken", disabled=True),
-        "baked_afternoon": st.column_config.NumberColumn("Gestern nachm. gebacken", disabled=True),
-        "waste_qty": st.column_config.NumberColumn("Gestern Abschrift", min_value=0, step=1),
-        "early_empty": st.column_config.CheckboxColumn("Gestern vor 14 Uhr leer"),
-    }
-)
+    editor2 = st.data_editor(
+        v[["sku","name","baked_total","waste_qty","early_empty"]],
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "baked_total": st.column_config.NumberColumn("Gestern gebacken (Info)", disabled=True),
+            "waste_qty": st.column_config.NumberColumn("Gestern Abschrift", min_value=0, step=1),
+            "early_empty": st.column_config.CheckboxColumn("Vor 14 Uhr leer"),
+        }
+    )
 
-c_save, c_finish = st.columns([1, 2])
-save_y = c_save.button("💾 Gestern speichern", type="secondary")
-finish_y = c_finish.button("✅ Gestern abschließen & Lernen", type="primary")
+    b_save, b_close = st.columns([1, 2])
+    do_save = b_save.button("💾 Speichern", type="secondary")
+    do_close = b_close.button("✅ Abschluss & Lernen", type="primary")
 
-def apply_yesterday_updates(y_editor_df: pd.DataFrame) -> pd.DataFrame:
-    upd = y_editor_df.copy()
-    upd["sku"] = upd["sku"].astype(str).map(clean_sku)
-    upd = upd[upd["sku"] != ""].copy()
-    upd["waste_qty"] = pd.to_numeric(upd["waste_qty"], errors="coerce").fillna(0).astype(int)
-    upd["early_empty"] = upd["early_empty"].astype(bool)
+    if do_save or do_close:
+        # merge back into base
+        b0 = base.set_index("sku")
+        ed = editor2.copy()
+        ed["sku"] = ed["sku"].astype(str).map(clean_sku)
+        ed = ed[ed["sku"] != ""].set_index("sku")
 
-    base = y_tbl.copy()
-    base["sku"] = base["sku"].astype(str)
-    base = base.set_index("sku")
-    upd = upd.set_index("sku")
-    common = base.index.intersection(upd.index)
-    base.loc[common, "waste_qty"] = upd.loc[common, "waste_qty"]
-    base.loc[common, "early_empty"] = upd.loc[common, "early_empty"]
-    base = base.reset_index()
-    return base
+        common = b0.index.intersection(ed.index)
+        b0.loc[common, "waste_qty"] = pd.to_numeric(ed.loc[common, "waste_qty"], errors="coerce").fillna(0).astype(int)
+        b0.loc[common, "early_empty"] = ed.loc[common, "early_empty"].astype(bool)
 
-if save_y or finish_y:
-    base = apply_yesterday_updates(y_editor)
+        if do_close:
+            b0["closed"] = True
 
-    # write yesterday rows
-    rows = []
-    for _, r in base.iterrows():
-        rows.append({
-            "date": yesterday_s,
-            "sku": str(r["sku"]),
-            "baked_morning": int(r["baked_morning"]),
-            "baked_afternoon": int(r["baked_afternoon"]),
-            "waste_qty": int(r["waste_qty"]),
-            "early_empty": "TRUE" if bool(r["early_empty"]) else "FALSE",
-            "closed": "TRUE" if bool(finish_y) else ("TRUE" if bool(r["closed"]) else "FALSE"),
-            "created_at": pd.Timestamp.utcnow().isoformat(),
-        })
-    upsert_tab(sh, "daily_log", pd.DataFrame(rows), key_cols=["date","sku"])
+        b0 = b0.reset_index()
 
-    if finish_y:
-        # -------- Lernen auf Grundlage von GESTERN --------
-        # model BEFORE snapshot (für sichtbaren Effekt)
-        model_before = model.copy()
-        model_before["demand"] = pd.to_numeric(model_before["demand"], errors="coerce").fillna(START_DEMAND)
-        model_before["morning_share"] = pd.to_numeric(model_before["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
-        model_before["waste_rate"] = pd.to_numeric(model_before["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
+        # write waste_log for yesterday
+        rows = []
+        for _, r in b0.iterrows():
+            rows.append({
+                "date": yesterday_s,
+                "sku": str(r["sku"]),
+                "waste_qty": int(r["waste_qty"]),
+                "early_empty": "TRUE" if bool(r["early_empty"]) else "FALSE",
+                "closed": "TRUE" if bool(r["closed"]) else "FALSE",
+                "updated_at": now_iso(),
+            })
+        upsert_rows("waste_log", ["date","sku"], rows)
 
-        # rows for yesterday (fresh read)
-        tabs2 = load_all(force=True)
-        logs2 = ensure_columns(tabs2["daily_log"], ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
-        logs2["date"] = logs2["date"].astype(str)
-        logs2["sku"] = logs2["sku"].astype(str)
-        y_rows = logs2[logs2["date"] == yesterday_s].copy()
+        if do_close:
+            # Learn from yesterday only if we have yesterday baked totals
+            # Merge again from cached tables
+            invalidate_cache()
+            tabsN = load_tables(sheet_id)
+            bakeN = ensure_df_cols(tabsN["bake_log"], REQUIRED_TABS["bake_log"])
+            wasteN = ensure_df_cols(tabsN["waste_log"], REQUIRED_TABS["waste_log"])
+            modelN = ensure_df_cols(tabsN["demand_model"], REQUIRED_TABS["demand_model"])
 
-        y_rows["baked_morning"] = pd.to_numeric(y_rows["baked_morning"], errors="coerce").fillna(0.0)
-        y_rows["baked_afternoon"] = pd.to_numeric(y_rows["baked_afternoon"], errors="coerce").fillna(0.0)
-        y_rows["waste_qty"] = pd.to_numeric(y_rows["waste_qty"], errors="coerce").fillna(0.0)
-        y_rows["early_empty"] = y_rows["early_empty"].apply(parse_bool)
+            bakeN["date"] = bakeN["date"].astype(str)
+            bakeN["sku"] = bakeN["sku"].astype(str).map(clean_sku)
+            b_y2 = bakeN[bakeN["date"] == yesterday_s].copy()
+            b_y2["baked_morning"] = pd.to_numeric(b_y2["baked_morning"], errors="coerce").fillna(0).astype(int)
+            b_y2["baked_afternoon"] = pd.to_numeric(b_y2["baked_afternoon"], errors="coerce").fillna(0).astype(int)
+            b_y2["baked_total"] = b_y2["baked_morning"] + b_y2["baked_afternoon"]
 
-        model2 = ensure_model_rows(tabs2["demand_model"], active_skus)
-        model2["demand"] = pd.to_numeric(model2["demand"], errors="coerce").fillna(START_DEMAND)
-        model2["morning_share"] = pd.to_numeric(model2["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
-        model2["waste_rate"] = pd.to_numeric(model2["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
+            wasteN["date"] = wasteN["date"].astype(str)
+            wasteN["sku"] = wasteN["sku"].astype(str).map(clean_sku)
+            w_y2 = wasteN[wasteN["date"] == yesterday_s].copy()
+            w_y2["waste_qty"] = pd.to_numeric(w_y2["waste_qty"], errors="coerce").fillna(0).astype(int)
+            w_y2["early_empty"] = w_y2["early_empty"].astype(str).str.lower().isin(["true","1","yes","ja"])
 
-        # Update per SKU for yesterday weekday
-        for _, r in y_rows.iterrows():
-            sku = clean_sku(r["sku"])
-            if not sku:
-                continue
-            baked_total = float(r["baked_morning"] + r["baked_afternoon"])
-            waste = float(r["waste_qty"])
-            sold_est = max(0.0, baked_total - waste)
+            y_rows = active[["sku"]].merge(b_y2[["sku","baked_total"]], on="sku", how="left").merge(
+                w_y2[["sku","waste_qty","early_empty"]], on="sku", how="left"
+            )
+            y_rows["baked_total"] = pd.to_numeric(y_rows["baked_total"], errors="coerce").fillna(0).astype(int)
+            y_rows["waste_qty"] = pd.to_numeric(y_rows["waste_qty"], errors="coerce").fillna(0).astype(int)
+            y_rows["early_empty"] = y_rows["early_empty"].fillna(False).astype(bool)
 
-            mask = (model2["sku"].astype(str) == sku) & (model2["weekday"].astype(str) == wd_yesterday)
-            if not mask.any():
-                continue
-            i = model2.index[mask][0]
+            # Snapshot BEFORE for quick delta
+            model_before = ensure_model_for_active(modelN, active_skus)
 
-            old_demand = float(model2.at[i, "demand"])
-            old_ms = float(model2.at[i, "morning_share"])
-            old_wr = float(model2.at[i, "waste_rate"])
+            # Learn
+            model_after = learn_from_yesterday(ensure_model_for_active(modelN, active_skus), y_rows, wd_yesterday)
 
-            # Demand lernt aus "verkauft geschätzt" (gebacken - abschrift)
-            new_demand = (1 - ALPHA) * old_demand + ALPHA * sold_est
+            # Write model back (upsert)
+            rowsM = []
+            for _, r in model_after.iterrows():
+                rowsM.append({
+                    "sku": str(r["sku"]),
+                    "weekday": str(r["weekday"]),
+                    "demand": float(r["demand"]),
+                    "morning_share": float(r["morning_share"]),
+                    "waste_rate": float(r["waste_rate"]),
+                    "updated_at": str(r.get("updated_at","") or ""),
+                })
+            upsert_rows("demand_model", ["sku","weekday"], rowsM)
 
-            # Waste-rate lernt aus Abschriftquote
-            wr_obs = (waste / baked_total) if baked_total > 0 else 0.0
-            new_wr = (1 - ALPHA) * old_wr + ALPHA * wr_obs
-            new_wr = clamp01(new_wr)
+            # Show effect for today's recommendation
+            def rec_table(model_df):
+                mt = model_df[model_df["weekday"].astype(str) == wd_today].copy()
+                mt = mt.merge(active[["sku","name"]], on="sku", how="inner")
+                mt["demand"] = pd.to_numeric(mt["demand"], errors="coerce").fillna(START_DEMAND)
+                mt["morning_share"] = pd.to_numeric(mt["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
+                mt["waste_rate"] = pd.to_numeric(mt["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
+                mt["total"] = mt.apply(lambda r: recommend_total(r["demand"], r["waste_rate"]), axis=1)
+                sp = mt.apply(lambda r: split_qty(int(r["total"]), float(r["morning_share"])), axis=1)
+                mt["m"] = [a for a,b in sp]
+                mt["a"] = [b for a,b in sp]
+                return mt[["sku","name","m","a"]]
 
-            # Morning-share: wenn gestern vor 14 leer -> mehr Anteil morgens
-            ms_target = old_ms
-            if bool(r["early_empty"]):
-                ms_target = min(0.95, old_ms + 0.06)
-            else:
-                # wenn Abschrift hoch -> weniger aggressiv morgens
-                if new_wr >= 0.12:
-                    ms_target = max(0.55, old_ms - 0.04)
+            beforeR = rec_table(model_before).rename(columns={"m":"vor_m","a":"vor_a"})
+            afterR  = rec_table(model_after).rename(columns={"m":"neu_m","a":"neu_a"})
+            delta = beforeR.merge(afterR, on=["sku","name"], how="inner")
+            delta["Δ morgens"] = delta["neu_m"] - delta["vor_m"]
+            delta["Δ nachm"] = delta["neu_a"] - delta["vor_a"]
+            delta = delta.sort_values(["Δ morgens","Δ nachm"], ascending=False)
 
-            new_ms = (1 - ALPHA) * old_ms + ALPHA * ms_target
-            new_ms = float(np.clip(new_ms, 0.55, 0.95))
+            st.success("Abschluss gespeichert ✅ App hat gelernt. Empfehlungen wurden aktualisiert.")
+            with st.expander("Änderung in der Empfehlung (heute)", expanded=True):
+                st.dataframe(delta[["name","vor_m","neu_m","Δ morgens","vor_a","neu_a","Δ nachm"]], use_container_width=True, hide_index=True)
 
-            model2.at[i, "demand"] = max(0.0, float(new_demand))
-            model2.at[i, "waste_rate"] = float(new_wr)
-            model2.at[i, "morning_share"] = float(new_ms)
-            model2.at[i, "updated_at"] = pd.Timestamp.utcnow().isoformat()
+        else:
+            st.success("Gespeichert ✅")
+        st.rerun()
 
-        # Write model back
-        write_tab(sh, "demand_model", model2[["sku","weekday","demand","morning_share","waste_rate","updated_at"]])
+# ---------------------------------------------------------
+# TAB 3: Dashboard
+# ---------------------------------------------------------
+with tab3:
+    st.subheader("Dashboard")
+    st.caption("Kurzüberblick aus den letzten Tagen.")
 
-        # Show effect (sofort sichtbar)
-        # recompute today rec before/after for a quick delta table
-        mb_today = model_before[model_before["weekday"].astype(str) == wd_today].copy()
-        ma_today = model2[model2["weekday"].astype(str) == wd_today].copy()
+    # Build last 14 days aggregates
+    tabsD = load_tables(sheet_id)
+    bakeD = ensure_df_cols(tabsD["bake_log"], REQUIRED_TABS["bake_log"])
+    wasteD = ensure_df_cols(tabsD["waste_log"], REQUIRED_TABS["waste_log"])
 
-        mb_today = mb_today.merge(active_articles[["sku","name"]], on="sku", how="inner")
-        ma_today = ma_today.merge(active_articles[["sku","name"]], on="sku", how="inner")
+    bakeD["date"] = pd.to_datetime(bakeD["date"], errors="coerce")
+    wasteD["date"] = pd.to_datetime(wasteD["date"], errors="coerce")
 
-        def rec_df(df):
-            df = df.copy()
-            df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(START_DEMAND)
-            df["morning_share"] = pd.to_numeric(df["morning_share"], errors="coerce").fillna(START_MORNING_SHARE)
-            df["waste_rate"] = pd.to_numeric(df["waste_rate"], errors="coerce").fillna(START_WASTE_RATE)
-            df["rec_total"] = df.apply(lambda r: recommend_total(r["demand"], r["waste_rate"]), axis=1)
-            sp = df.apply(lambda r: split_qty(int(r["rec_total"]), float(r["morning_share"])), axis=1)
-            df["rec_morning"] = [m for m, a in sp]
-            df["rec_afternoon"] = [a for m, a in sp]
-            return df[["sku","name","rec_morning","rec_afternoon"]]
-
-        before_rec = rec_df(mb_today).rename(columns={"rec_morning":"vor_morgens","rec_afternoon":"vor_nachm"})
-        after_rec = rec_df(ma_today).rename(columns={"rec_morning":"neu_morgens","rec_afternoon":"neu_nachm"})
-
-        delta = before_rec.merge(after_rec, on=["sku","name"], how="inner")
-        delta["Δ morgens"] = delta["neu_morgens"] - delta["vor_morgens"]
-        delta["Δ nachm"] = delta["neu_nachm"] - delta["vor_nachm"]
-        delta = delta.sort_values(["Δ morgens","Δ nachm"], ascending=False)
-
-        st.success("Gestern abgeschlossen ✅ Die App hat gelernt und die Empfehlungen wurden aktualisiert.")
-        with st.expander("Was hat sich in der Empfehlung geändert? (heute)", expanded=True):
-            st.dataframe(delta[["name","vor_morgens","neu_morgens","Δ morgens","vor_nachm","neu_nachm","Δ nachm"]], use_container_width=True, hide_index=True)
-
-    else:
-        st.success("Gestern gespeichert ✅ (Lernen passiert erst bei „Gestern abschließen & Lernen“).")
-
-    load_all(force=True)
-    st.rerun()
-
-# -------------------------
-# Mini Dashboard (optional)
-# -------------------------
-st.divider()
-st.markdown("### 📊 Überblick (letzte 14 Tage)")
-
-tabs3 = load_all(force=False)
-logs = ensure_columns(tabs3["daily_log"], ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
-if logs.empty:
-    st.info("Noch keine Daten.")
-else:
-    logs["date_dt"] = pd.to_datetime(logs["date"], errors="coerce")
-    logs = logs.dropna(subset=["date_dt"]).copy()
-    logs["waste_qty"] = pd.to_numeric(logs["waste_qty"], errors="coerce").fillna(0.0)
-    logs["early_empty"] = logs["early_empty"].apply(parse_bool)
-    logs["baked_total"] = pd.to_numeric(logs["baked_morning"], errors="coerce").fillna(0.0) + pd.to_numeric(logs["baked_afternoon"], errors="coerce").fillna(0.0)
+    bakeD = bakeD.dropna(subset=["date"]).copy()
+    wasteD = wasteD.dropna(subset=["date"]).copy()
 
     cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=14)
-    df14 = logs[logs["date_dt"] >= cutoff].copy()
-    name_map = active_articles[["sku","name"]].drop_duplicates()
-    df14["sku"] = df14["sku"].astype(str)
-    df14 = df14.merge(name_map, on="sku", how="left")
+    bake14 = bakeD[bakeD["date"] >= cutoff].copy()
+    waste14 = wasteD[wasteD["date"] >= cutoff].copy()
+
+    bake14["sku"] = bake14["sku"].astype(str).map(clean_sku)
+    waste14["sku"] = waste14["sku"].astype(str).map(clean_sku)
+
+    bake14["baked_total"] = (
+        pd.to_numeric(bake14["baked_morning"], errors="coerce").fillna(0)
+        + pd.to_numeric(bake14["baked_afternoon"], errors="coerce").fillna(0)
+    )
+    waste14["waste_qty"] = pd.to_numeric(waste14["waste_qty"], errors="coerce").fillna(0)
+
+    df = bake14.merge(waste14[["date","sku","waste_qty","early_empty"]], on=["date","sku"], how="left")
+    df["waste_qty"] = df["waste_qty"].fillna(0)
+    df["early_empty"] = df["early_empty"].astype(str).str.lower().isin(["true","1","yes","ja"])
+
+    name_map = active[["sku","name"]].drop_duplicates()
+    df = df.merge(name_map, on="sku", how="left")
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Abschrift (14 Tage)", int(df14["waste_qty"].sum()))
-    c2.metric("Vor 14 Uhr leer (14 Tage)", int(df14["early_empty"].sum()))
-    c3.metric("Blech-/Backmenge (14 Tage)", int(df14["baked_total"].sum()))
+    c1.metric("Gebacken (14 Tage)", int(df["baked_total"].sum()) if not df.empty else 0)
+    c2.metric("Abschrift (14 Tage)", int(df["waste_qty"].sum()) if not df.empty else 0)
+    waste_rate = (df["waste_qty"].sum() / df["baked_total"].sum()) if (not df.empty and df["baked_total"].sum() > 0) else 0.0
+    c3.metric("Abschriftquote", f"{waste_rate*100:.1f}%")
 
-    top_waste = df14.groupby("name", as_index=False).agg(abschrift=("waste_qty","sum")).sort_values("abschrift", ascending=False).head(10)
-    st.write("**Top Abschrift**")
-    st.dataframe(top_waste, use_container_width=True, hide_index=True)
+    if df.empty:
+        st.info("Noch nicht genug Daten für Dashboard.")
+    else:
+        top_waste = df.groupby("name", as_index=False).agg(abschrift=("waste_qty","sum")).sort_values("abschrift", ascending=False).head(10)
+        top_empty = df.groupby("name", as_index=False).agg(vor14_leer=("early_empty","sum")).sort_values("vor14_leer", ascending=False).head(10)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.write("**Top Abschrift (14 Tage)**")
+            st.dataframe(top_waste, use_container_width=True, hide_index=True)
+        with cc2:
+            st.write("**Häufig vor 14 Uhr leer (14 Tage)**")
+            st.dataframe(top_empty, use_container_width=True, hide_index=True)
