@@ -1,5 +1,6 @@
 # =========================================================
 # Bake-Off Planer – Finale Version (1 Seite, markt-tauglich)
+# FIX: robuster Umgang mit leeren/kaputten SKU-Zeilen (ValueError)
 # - Artikel anlegen in kleinem Bereich (stört Tagesarbeit nicht)
 # - Planung (nur lesen)
 # - Arbeitstabelle wie Excel (A=Artikel, daneben Eingaben)
@@ -30,9 +31,9 @@ START_MORNING_SHARE = 0.75
 START_WASTE_RATE = 0.10
 
 # Weiche Zeitfenster (nur Warnung)
-WIN_MORNING = (5, 11)     # morgens
-WIN_AFTERNOON = (12, 17)  # nachmittags
-WIN_CLOSE = (18, 23)      # abends/abschluss
+WIN_MORNING = (5, 11)      # morgens
+WIN_AFTERNOON = (12, 17)   # nachmittags
+WIN_CLOSE = (18, 23)       # abends/abschluss
 
 CACHE_TTL_SEC = 120
 
@@ -114,6 +115,8 @@ def upsert_tab(sh, tab: str, df_new: pd.DataFrame, key_cols: list[str]):
         df = pd.concat([df_old, df_new], ignore_index=True)
 
     for c in key_cols:
+        if c not in df.columns:
+            df[c] = ""
         df[c] = df[c].astype(str)
     df = df.drop_duplicates(subset=key_cols, keep="last")
     write_tab(sh, tab, df)
@@ -143,11 +146,58 @@ def weekday_name(d: date) -> str:
 def in_window(hour: int, win: tuple[int, int]) -> bool:
     return win[0] <= hour <= win[1]
 
-def clamp_int(x) -> int:
-    try:
-        return int(float(x))
-    except Exception:
-        return 0
+def clean_sku_list(series: pd.Series) -> list[str]:
+    # Robust: entfernt NaN, leere Strings, "nan", "none"
+    out = []
+    for x in series.tolist():
+        s = str(x).strip()
+        if not s:
+            continue
+        if s.lower() in ("nan", "none", "null"):
+            continue
+        out.append(s)
+    # Unique, stable order
+    seen = set()
+    uniq = []
+    for s in out:
+        if s not in seen:
+            uniq.append(s)
+            seen.add(s)
+    return uniq
+
+def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    return out
+
+def ensure_model_rows(model: pd.DataFrame, articles: pd.DataFrame) -> pd.DataFrame:
+    weekdays = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+    model = ensure_columns(model if not model.empty else pd.DataFrame(), ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
+    articles = ensure_columns(articles if not articles.empty else pd.DataFrame(), ["sku","name","active","created_at"])
+
+    if articles.empty:
+        return model
+
+    # Active + clean
+    arts = articles.copy()
+    arts["sku"] = arts["sku"].astype(str)
+    arts["active"] = arts["active"].astype(str)
+    active = arts[arts["active"].str.lower().isin(["true","1","yes","ja"])].copy()
+    sku_list = clean_sku_list(active["sku"])
+    if not sku_list:
+        return model
+
+    base = pd.MultiIndex.from_product([sku_list, weekdays], names=["sku","weekday"]).to_frame(index=False)
+    out = base.merge(model, on=["sku","weekday"], how="left")
+
+    out["demand"] = pd.to_numeric(out.get("demand"), errors="coerce").fillna(START_DEMAND)
+    out["morning_share"] = pd.to_numeric(out.get("morning_share"), errors="coerce").fillna(START_MORNING_SHARE)
+    out["waste_rate"] = pd.to_numeric(out.get("waste_rate"), errors="coerce").fillna(START_WASTE_RATE)
+    out["updated_at"] = out.get("updated_at", "").fillna("")
+    return out
 
 def clamp_float(x, lo=0.0, hi=1.0) -> float:
     try:
@@ -155,30 +205,6 @@ def clamp_float(x, lo=0.0, hi=1.0) -> float:
     except Exception:
         v = 0.0
     return float(max(lo, min(hi, v)))
-
-def ensure_model_rows(model: pd.DataFrame, articles: pd.DataFrame) -> pd.DataFrame:
-    weekdays = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-
-    if model.empty:
-        model = pd.DataFrame(columns=["sku","weekday","demand","morning_share","waste_rate","updated_at"])
-    if articles.empty:
-        return model
-
-    active = articles[articles["active"].astype(str).str.lower().isin(["true","1","yes","ja"])].copy()
-    if active.empty:
-        return model
-
-    base = pd.MultiIndex.from_product(
-        [active["sku"].astype(str).tolist(), weekdays],
-        names=["sku","weekday"]
-    ).to_frame(index=False)
-
-    out = base.merge(model, on=["sku","weekday"], how="left")
-    out["demand"] = pd.to_numeric(out.get("demand"), errors="coerce").fillna(START_DEMAND)
-    out["morning_share"] = pd.to_numeric(out.get("morning_share"), errors="coerce").fillna(START_MORNING_SHARE)
-    out["waste_rate"] = pd.to_numeric(out.get("waste_rate"), errors="coerce").fillna(START_WASTE_RATE)
-    out["updated_at"] = out.get("updated_at", "").fillna("")
-    return out
 
 def recommend_total(demand: float, waste_rate: float) -> int:
     # Leicht konservativ bei hoher Abschriftquote
@@ -193,13 +219,9 @@ def split_qty(total: int, morning_share: float) -> tuple[int, int]:
     ms = float(np.clip(morning_share, 0.55, 0.95))
     m = int(np.round(total * ms))
     a = max(0, total - m)
-    # wenn Nachmittag sehr klein -> als 1× behandeln
     if a <= 2:
         return total, 0
-
-    # harte Untergrenze: Nachmittag nicht absurd groß
     if a > m:
-        # wenn Model ausreißt, dämpfen
         m = int(np.round(total * 0.70))
         a = total - m
     return m, a
@@ -208,11 +230,9 @@ def build_work_table(active_articles: pd.DataFrame, plan_df: pd.DataFrame, today
     base = active_articles[["sku","name"]].copy()
     base["date"] = today_s
 
-    # Empfehlungsspalten
     plan_min = plan_df[["sku","rec_morning","rec_afternoon","mode","hint"]].copy()
     out = base.merge(plan_min, on="sku", how="left")
 
-    # heutige Eingaben
     if today_log.empty:
         out["baked_morning"] = 0
         out["baked_afternoon"] = 0
@@ -233,7 +253,6 @@ def build_work_table(active_articles: pd.DataFrame, plan_df: pd.DataFrame, today
         cl = out.get("closed", "")
         out["closed"] = cl.astype(str).str.lower().isin(["true","1","yes","ja"])
 
-    # sort: empfohlene zuerst
     out["rec_total"] = pd.to_numeric(out["rec_morning"], errors="coerce").fillna(0) + pd.to_numeric(out["rec_afternoon"], errors="coerce").fillna(0)
     out = out.sort_values(["rec_total","name"], ascending=[False, True])
     return out
@@ -242,12 +261,9 @@ def status_hints(df: pd.DataFrame) -> list[str]:
     hints = []
     if df.empty:
         return ["Keine Artikel sichtbar (Filter?)."]
-    # geschlossen?
     any_closed = bool(df["closed"].any()) if "closed" in df.columns else False
     if not any_closed:
         hints.append("Tagesabschluss ist noch nicht bestätigt („Fertig für heute“).")
-
-    # Backen-Eingaben vorhanden?
     baked_any = ((df["baked_morning"] + df["baked_afternoon"]) > 0).sum()
     if baked_any == 0:
         hints.append("Noch keine Backmengen eingetragen.")
@@ -273,23 +289,22 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-articles = tabs["articles"]
-daily_log = tabs["daily_log"]
-model = tabs["demand_model"]
-
-# Normalize tables
-if articles.empty:
-    articles = pd.DataFrame(columns=["sku","name","active","created_at"])
-else:
-    articles["sku"] = articles["sku"].astype(str)
-    articles["name"] = articles.get("name", articles["sku"]).astype(str)
-    articles["active"] = articles.get("active", "TRUE").astype(str)
+articles = ensure_columns(tabs["articles"], ["sku","name","active","created_at"])
+daily_log = ensure_columns(tabs["daily_log"], ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
+model = ensure_columns(tabs["demand_model"], ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
 
 today = date.today()
 today_s = today.isoformat()
 wd = weekday_name(today)
 now = datetime.now()
 hour = now.hour
+
+# Normalize articles clean
+articles["sku"] = articles["sku"].astype(str)
+articles["name"] = articles["name"].astype(str)
+articles["active"] = articles["active"].astype(str)
+# remove blank sku rows to avoid downstream issues
+articles = articles[~articles["sku"].astype(str).str.strip().isin(["", "nan", "None", "null"])].copy()
 
 # -------------------------
 # Artikelverwaltung (klein & einklappbar)
@@ -318,10 +333,13 @@ with st.expander("Artikel anlegen / aktivieren (selten nötig)", expanded=False)
             }])
             upsert_tab(sh, "articles", row, key_cols=["sku"])
 
-            # Modellzeilen ergänzen
+            # Modellzeilen ergänzen (robust)
             tabs2 = load_all(force=True)
-            arts2 = tabs2["articles"]
-            mdl2 = tabs2["demand_model"]
+            arts2 = ensure_columns(tabs2["articles"], ["sku","name","active","created_at"])
+            mdl2 = ensure_columns(tabs2["demand_model"], ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
+            arts2["sku"] = arts2["sku"].astype(str)
+            arts2 = arts2[~arts2["sku"].str.strip().isin(["", "nan", "None", "null"])].copy()
+
             mdl2 = ensure_model_rows(mdl2, arts2)
             write_tab(sh, "demand_model", mdl2[["sku","weekday","demand","morning_share","waste_rate","updated_at"]])
 
@@ -334,7 +352,7 @@ with st.expander("Artikel anlegen / aktivieren (selten nötig)", expanded=False)
         st.info("Noch keine Artikel.")
     else:
         arts_ui = articles.copy()
-        arts_ui["active"] = arts_ui["active"].astype(str).str.lower().isin(["true","1","yes","ja"])
+        arts_ui["active"] = arts_ui["active"].str.lower().isin(["true","1","yes","ja"])
         edited_arts = st.data_editor(
             arts_ui[["sku","name","active"]],
             use_container_width=True,
@@ -347,9 +365,13 @@ with st.expander("Artikel anlegen / aktivieren (selten nötig)", expanded=False)
             out["created_at"] = pd.Timestamp.utcnow().isoformat()
             upsert_tab(sh, "articles", out[["sku","name","active","created_at"]], key_cols=["sku"])
 
-            # Modellzeilen sicherstellen
             arts2 = read_tab(sh, "articles")
+            arts2 = ensure_columns(arts2, ["sku","name","active","created_at"])
+            arts2["sku"] = arts2["sku"].astype(str)
+            arts2 = arts2[~arts2["sku"].str.strip().isin(["", "nan", "None", "null"])].copy()
+
             mdl2 = read_tab(sh, "demand_model")
+            mdl2 = ensure_columns(mdl2, ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
             mdl2 = ensure_model_rows(mdl2, arts2)
             write_tab(sh, "demand_model", mdl2[["sku","weekday","demand","morning_share","waste_rate","updated_at"]])
 
@@ -357,14 +379,17 @@ with st.expander("Artikel anlegen / aktivieren (selten nötig)", expanded=False)
             load_all(force=True)
             st.rerun()
 
-# Reload normalized after potential changes
+# Reload
 tabs = load_all(force=False)
-articles = tabs["articles"]
-daily_log = tabs["daily_log"]
-model = tabs["demand_model"]
+articles = ensure_columns(tabs["articles"], ["sku","name","active","created_at"])
+daily_log = ensure_columns(tabs["daily_log"], ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
+model = ensure_columns(tabs["demand_model"], ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
 
-# Active articles
+articles["sku"] = articles["sku"].astype(str)
+articles["name"] = articles["name"].astype(str)
 articles["active"] = articles["active"].astype(str)
+articles = articles[~articles["sku"].str.strip().isin(["", "nan", "None", "null"])].copy()
+
 active_articles = articles[articles["active"].str.lower().isin(["true","1","yes","ja"])].copy()
 active_articles = active_articles.sort_values("name")
 
@@ -372,7 +397,6 @@ if active_articles.empty:
     st.warning("Keine aktiven Artikel. Bitte im Artikelbereich aktivieren.")
     st.stop()
 
-# Ensure model rows
 model = ensure_model_rows(model, articles)
 
 # Today's log slice
@@ -448,7 +472,7 @@ st.divider()
 # Schritt 2 & 3: Arbeitstabelle (Excel-Stil)
 # -------------------------
 st.markdown("## 🟢 Schritt 2 & 🟡 Schritt 3 – Arbeitstabelle (einfach wie Excel)")
-st.caption("Spalte A = Artikel, daneben trägst du Stückzahlen ein. Du musst nicht jeden Artikel „einzeln aufklappen“.")
+st.caption("Spalte A = Artikel, daneben trägst du Stückzahlen ein. Filter nutzen, damit du nur die relevanten Zeilen siehst.")
 
 work = build_work_table(active_articles, plan, today_log, today_s)
 
@@ -525,19 +549,14 @@ with b2:
 with b3:
     st.caption("„Zwischenspeichern“ jederzeit. „Fertig für heute“ setzt den Tag auf abgeschlossen und **erst dann lernt** die App.")
 
-# Determine if we need time-window warning
 def needs_time_warning(edited_df: pd.DataFrame, original_df: pd.DataFrame) -> list[str]:
     msgs = []
-    # Compare on sku
     o = original_df.set_index("sku")
     e = edited_df.set_index("sku")
-
-    # Align
     common = e.index.intersection(o.index)
     if len(common) == 0:
         return msgs
 
-    # Detect changed fields
     changed_m = (e.loc[common, "baked_morning"].astype(int) != o.loc[common, "baked_morning"].astype(int)).any()
     changed_a = (e.loc[common, "baked_afternoon"].astype(int) != o.loc[common, "baked_afternoon"].astype(int)).any()
     changed_close = (
@@ -553,25 +572,18 @@ def needs_time_warning(edited_df: pd.DataFrame, original_df: pd.DataFrame) -> li
         msgs.append("⚠️ Du änderst **Abschlussfelder** (Abschrift/Vor14leer) außerhalb der üblichen Abendzeit.")
     return msgs
 
-# Map edited back into full work table
 def merge_back(full_work: pd.DataFrame, edited_view: pd.DataFrame) -> pd.DataFrame:
     out = full_work.copy()
     ed = edited_view.copy()
     ed["sku"] = ed["sku"].astype(str)
 
-    # Only keep input columns
     ed = ed[["sku","baked_morning","baked_afternoon","waste_qty","early_empty"]].copy()
     ed["baked_morning"] = pd.to_numeric(ed["baked_morning"], errors="coerce").fillna(0).astype(int)
     ed["baked_afternoon"] = pd.to_numeric(ed["baked_afternoon"], errors="coerce").fillna(0).astype(int)
     ed["waste_qty"] = pd.to_numeric(ed["waste_qty"], errors="coerce").fillna(0).astype(int)
     ed["early_empty"] = ed["early_empty"].astype(bool)
 
-    out = out.drop(columns=["baked_morning","baked_afternoon","waste_qty","early_empty"], errors="ignore")
-    out = out.merge(ed, on="sku", how="left")
-
-    # For rows not shown in editor, keep existing values by re-joining from original work:
-    # (We handle by starting from original full_work and only overwriting for SKUs in ed)
-    out2 = full_work.copy()
+    out2 = out.copy()
     out2["sku"] = out2["sku"].astype(str)
     for _, r in ed.iterrows():
         mask = out2["sku"] == r["sku"]
@@ -581,12 +593,9 @@ def merge_back(full_work: pd.DataFrame, edited_view: pd.DataFrame) -> pd.DataFra
         out2.loc[mask, "early_empty"] = bool(r["early_empty"])
     return out2
 
-# Save / Finish actions
 if save_btn or finish_btn:
-    # Apply editor changes to full work data
     new_work = merge_back(work, edited)
 
-    # Time window warnings
     warnings = needs_time_warning(edited, view)
     if warnings and "confirm_outside" not in st.session_state:
         st.session_state["confirm_outside"] = False
@@ -602,12 +611,11 @@ if save_btn or finish_btn:
     if can_continue:
         sh = open_spreadsheet()
 
-        # Prepare daily_log upsert for all active SKUs (full set), so the day is consistent
         to_write = new_work[["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed"]].copy()
         to_write["date"] = today_s
         to_write["sku"] = to_write["sku"].astype(str)
 
-        # Preserve existing 'closed' if already closed unless finish pressed
+        # preserve already closed unless finishing
         if not today_log.empty:
             prev_closed = today_log[["sku","closed"]].copy()
             prev_closed["sku"] = prev_closed["sku"].astype(str)
@@ -636,16 +644,22 @@ if save_btn or finish_btn:
 
         # Learn only on finish
         if finish_btn:
-            # Reload latest model + articles
             arts2 = read_tab(sh, "articles")
+            arts2 = ensure_columns(arts2, ["sku","name","active","created_at"])
+            arts2["sku"] = arts2["sku"].astype(str)
+            arts2 = arts2[~arts2["sku"].str.strip().isin(["", "nan", "None", "null"])].copy()
+
             logs2 = read_tab(sh, "daily_log")
+            logs2 = ensure_columns(logs2, ["date","sku","baked_morning","baked_afternoon","waste_qty","early_empty","closed","created_at"])
             mdl2 = read_tab(sh, "demand_model")
+            mdl2 = ensure_columns(mdl2, ["sku","weekday","demand","morning_share","waste_rate","updated_at"])
+
             mdl2 = ensure_model_rows(mdl2, arts2)
 
             logs2["date"] = logs2["date"].astype(str)
             logs2["sku"] = logs2["sku"].astype(str)
-
             rows = logs2[logs2["date"] == today_s].copy()
+
             if not rows.empty:
                 rows["baked_morning"] = pd.to_numeric(rows.get("baked_morning", 0), errors="coerce").fillna(0.0)
                 rows["baked_afternoon"] = pd.to_numeric(rows.get("baked_afternoon", 0), errors="coerce").fillna(0.0)
@@ -669,16 +683,10 @@ if save_btn or finish_btn:
                     old_ms = float(pd.to_numeric(mdl2.at[i, "morning_share"], errors="coerce") or START_MORNING_SHARE)
                     old_wr = float(pd.to_numeric(mdl2.at[i, "waste_rate"], errors="coerce") or START_WASTE_RATE)
 
-                    # Update demand (EMA)
                     new_demand = (1 - ALPHA) * old_demand + ALPHA * sold_est
-
-                    # Update waste rate (EMA)
                     wr_obs = (waste / baked_total) if baked_total > 0 else 0.0
                     new_wr = (1 - ALPHA) * old_wr + ALPHA * wr_obs
 
-                    # Update morning_share:
-                    # - early_empty => morning share likely too low => increase
-                    # - if waste is high and not early_empty => decrease
                     ms_target = old_ms
                     if bool(r["early_empty"]):
                         ms_target = min(0.95, old_ms + 0.06)
@@ -686,7 +694,6 @@ if save_btn or finish_btn:
                         if new_wr >= 0.12:
                             ms_target = max(0.55, old_ms - 0.05)
 
-                    # If afternoon was always 0 and no early_empty, allow drift up toward 1×
                     if float(r["baked_afternoon"]) <= 0 and not bool(r["early_empty"]) and new_wr >= 0.10:
                         ms_target = min(0.95, max(ms_target, 0.80))
 
@@ -700,15 +707,11 @@ if save_btn or finish_btn:
 
                 write_tab(sh, "demand_model", mdl2[["sku","weekday","demand","morning_share","waste_rate","updated_at"]])
 
-        # reset confirmation flag
         if "confirm_outside" in st.session_state:
             st.session_state["confirm_outside"] = False
 
         load_all(force=True)
-        if finish_btn:
-            st.success("✅ Tag abgeschlossen. Die App hat gelernt.")
-        else:
-            st.success("💾 Gespeichert.")
+        st.success("✅ Tag abgeschlossen. Die App hat gelernt." if finish_btn else "💾 Gespeichert.")
         st.rerun()
 
 # -------------------------
@@ -727,7 +730,6 @@ else:
     df["early_empty"] = df.get("early_empty","").astype(str).str.lower().isin(["true","1","yes","ja"])
     df["sku"] = df["sku"].astype(str)
 
-    # last 14 days
     cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=14)
     df14 = df[df["date_dt"] >= cutoff].copy()
 
